@@ -2,7 +2,7 @@
 /**
  * Plugin Name: API Imbretex
  * Description: Import automatique des produits Imbretex avec prix et stock dans WooCommerce
- * Version: 5.9
+ * Version: 6.3
  * Author: Raphael
  */
 
@@ -650,6 +650,127 @@ function api_create_product_attributes($variant, $for_variation = false) {
 }
 
 // ============================================================
+// CRON : RÉCUPÉRATION AUTOMATIQUE DES NOUVEAUX PRODUITS
+// ============================================================
+
+// Activer le cron lors de l'activation du plugin
+register_activation_hook(__FILE__, 'api_schedule_daily_sync');
+function api_schedule_daily_sync() {
+    if (!wp_next_scheduled('api_daily_product_sync')) {
+        wp_schedule_event(time(), 'daily', 'api_daily_product_sync');
+    }
+}
+
+// Désactiver le cron lors de la désactivation du plugin
+register_deactivation_hook(__FILE__, 'api_unschedule_daily_sync');
+function api_unschedule_daily_sync() {
+    $timestamp = wp_next_scheduled('api_daily_product_sync');
+    if ($timestamp) {
+        wp_unschedule_event($timestamp, 'api_daily_product_sync');
+    }
+}
+
+// Action du cron : récupérer les produits des dernières 24h
+add_action('api_daily_product_sync', 'api_sync_new_products');
+function api_sync_new_products() {
+    // Date d'hier au format de l'API
+    $yesterday = date('d-m-Y', strtotime('-1 day'));
+    
+    // Récupérer les produits créés ou modifiés depuis hier
+    $new_products = api_fetch_products_from_api(
+        $yesterday, // sinceCreated
+        $yesterday, // sinceUpdated
+        10,
+        50 // Max 50 produits par jour
+    );
+    
+    if (!empty($new_products)) {
+        // Stocker les nouveaux produits
+        set_transient('api_new_products', $new_products, DAY_IN_SECONDS * 7); // 7 jours
+        
+        // Compter les nouveaux vs mis à jour
+        $count_new = 0;
+        $count_updated = 0;
+        
+        foreach ($new_products as $product) {
+            $wc_product_id = wc_get_product_id_by_sku($product['sku']);
+            if ($wc_product_id) {
+                $count_updated++;
+            } else {
+                $count_new++;
+            }
+        }
+        
+        // Stocker les statistiques
+        update_option('api_sync_stats', [
+            'last_sync' => current_time('mysql'),
+            'total' => count($new_products),
+            'new' => $count_new,
+            'updated' => $count_updated,
+            'date' => $yesterday
+        ]);
+        
+        error_log('API Imbretex - Sync automatique : ' . count($new_products) . ' produits récupérés');
+    }
+}
+
+// Fonction pour obtenir le nombre de nouveaux produits
+function api_get_new_products_count() {
+    $new_products = get_transient('api_new_products');
+    if (empty($new_products)) {
+        return 0;
+    }
+    
+    $count_new = 0;
+    foreach ($new_products as $product) {
+        $wc_product_id = wc_get_product_id_by_sku($product['sku']);
+        if (!$wc_product_id) {
+            $count_new++;
+        }
+    }
+    
+    return $count_new;
+}
+
+// Fonction pour obtenir le nombre de produits mis à jour
+function api_get_updated_products_count() {
+    $new_products = get_transient('api_new_products');
+    if (empty($new_products)) {
+        return 0;
+    }
+    
+    $count_updated = 0;
+    foreach ($new_products as $product) {
+        $wc_product_id = wc_get_product_id_by_sku($product['sku']);
+        if ($wc_product_id) {
+            $count_updated++;
+        }
+    }
+    
+    return $count_updated;
+}
+
+// AJAX : Marquer les produits comme vus
+add_action('wp_ajax_api_mark_products_seen', function() {
+    delete_transient('api_new_products');
+    delete_option('api_sync_stats');
+    wp_send_json_success();
+});
+
+// AJAX : Lancer le cron manuellement
+add_action('wp_ajax_api_run_sync_now', function() {
+    check_ajax_referer('api_sync_nonce', 'nonce');
+    
+    api_sync_new_products();
+    
+    $stats = get_option('api_sync_stats', []);
+    wp_send_json_success([
+        'message' => 'Synchronisation terminée',
+        'stats' => $stats
+    ]);
+});
+
+// ============================================================
 // AJAX : IMPORTER UN SEUL PRODUIT
 // ============================================================
 add_action('wp_ajax_api_import_single_product', function() {
@@ -685,9 +806,16 @@ add_action('wp_ajax_api_import_single_product', function() {
 // PAGE ADMIN
 // ============================================================
 add_action('admin_menu', function() {
+    $new_count = api_get_new_products_count();
+    $updated_count = api_get_updated_products_count();
+    $total_count = $new_count + $updated_count;
+    
+    // Toujours afficher le badge, même si le compte est 0
+    $menu_title = 'API Imbretex <span class="update-plugins count-' . $total_count . '"><span class="update-count">' . $total_count . '</span></span>';
+    
     add_menu_page(
         'API Imbretex',
-        'API Imbretex',
+        $menu_title,
         'manage_options',
         'api-products-list',
         'api_products_list_page',
@@ -702,28 +830,40 @@ function api_products_list_page() {
     $max_products = intval($_GET['max_products'] ?? 20);
     $force_reload = isset($_GET['reload']);
 
-    // Toujours charger des produits, même sans paramètres de recherche
-    $cache_key = 'api_products_list_' . md5($search_since_created . $search_since_updated . $per_page . $max_products);
-    if ($force_reload) {
-        delete_transient($cache_key);
-    }
-
-    $products = get_transient($cache_key);
+    // Vérifier si des produits synchronisés existent
+    $sync_products = get_transient('api_new_products');
+    $has_sync_products = !empty($sync_products);
     
-    // Si pas de cache OU si le cache est vide, charger depuis l'API
-    if (false === $products || empty($products)) {
-        // Appeler l'API même sans paramètres de date pour charger les produits par défaut
-        $products = api_fetch_products_from_api(
-            !empty($search_since_created) ? $search_since_created : null,
-            !empty($search_since_updated) ? $search_since_updated : null,
-            $per_page,
-            $max_products
-        );
-        set_transient($cache_key, $products, HOUR_IN_SECONDS);
-        set_transient('api_products_current_list', $products, HOUR_IN_SECONDS);
+    // Par défaut, afficher les produits synchronisés s'ils existent
+    // Sinon, charger via API normale
+    $showing_sync = false;
+    
+    if ($has_sync_products && empty($search_since_created) && empty($search_since_updated) && !$force_reload) {
+        // Afficher les produits synchronisés par défaut
+        $products = $sync_products;
+        $showing_sync = true;
     } else {
-        set_transient('api_products_current_list', $products, HOUR_IN_SECONDS);
+        // Comportement normal - charger via API
+        $cache_key = 'api_products_list_' . md5($search_since_created . $search_since_updated . $per_page . $max_products);
+        if ($force_reload) {
+            delete_transient($cache_key);
+        }
+
+        $products = get_transient($cache_key);
+        
+        // Si pas de cache OU si le cache est vide, charger depuis l'API
+        if (false === $products || empty($products)) {
+            $products = api_fetch_products_from_api(
+                !empty($search_since_created) ? $search_since_created : null,
+                !empty($search_since_updated) ? $search_since_updated : null,
+                $per_page,
+                $max_products
+            );
+            set_transient($cache_key, $products, HOUR_IN_SECONDS);
+        }
     }
+    
+    set_transient('api_products_current_list', $products, HOUR_IN_SECONDS);
 
     // Appliquer les filtres tableau
     $filter_sku = $_GET['filter_sku'] ?? '';
@@ -806,6 +946,49 @@ function api_products_list_page() {
     ?>
     <div class="wrap">
         <h1>📦 API Imbretex - Import Produits</h1>
+
+        <!-- Section Synchronisation automatique -->
+        <?php 
+        $sync_stats = get_option('api_sync_stats', []);
+        $new_products = get_transient('api_new_products');
+        $has_new_products = !empty($new_products);
+        $new_count = api_get_new_products_count();
+        $updated_count = api_get_updated_products_count();
+        $total_sync_count = $new_count + $updated_count;
+        ?>
+        <div style="background:#e7f7ff;padding:15px;margin:10px 0;box-shadow:0 1px 3px rgba(0,0,0,0.1);border-left:4px solid #2271b1;">
+            <div style="display:flex;justify-content:space-between;align-items:center;">
+                <h3 style="margin:0;color:#2271b1;">🔄 Synchronisation automatique</h3>
+                <div style="display:flex;align-items:center;gap:10px;">
+                    <span style="background:<?php echo $total_sync_count > 0 ? '#dc3232' : '#7e8993'; ?>;color:white;padding:5px 12px;border-radius:50%;font-weight:bold;font-size:14px;">
+                        <?php echo $total_sync_count; ?>
+                    </span>
+                    <?php if ($has_new_products): ?>
+                        <button type="button" id="clear-sync" class="button button-small" style="font-size:11px;" title="Effacer les produits synchronisés">
+                            ✕
+                        </button>
+                    <?php endif; ?>
+                </div>
+            </div>
+            
+            <?php if (!empty($sync_stats)): ?>
+                <p style="margin:10px 0 0 0;">
+                    <strong>Dernière synchronisation :</strong> <?php echo date('d/m/Y à H:i', strtotime($sync_stats['last_sync'])); ?><br>
+                    <strong>Produits trouvés :</strong> 
+                    <span style="color:#2271b1;font-weight:600;"><?php echo $sync_stats['total']; ?></span>
+                    (<?php echo $sync_stats['new']; ?> nouveaux, <?php echo $sync_stats['updated']; ?> mis à jour)
+                </p>
+                <?php if ($has_new_products && $showing_sync): ?>
+                    <p style="margin:5px 0 0 0;color:#2271b1;font-weight:600;">
+                        ✓ Les produits synchronisés sont affichés ci-dessous
+                    </p>
+                <?php endif; ?>
+            <?php else: ?>
+                <p style="margin:10px 0 0 0;color:#666;">
+                    Aucune synchronisation effectuée pour le moment. Le cron s'exécutera automatiquement chaque jour.
+                </p>
+            <?php endif; ?>
+        </div>
 
         <!-- Loader de recherche -->
         <div id="api-loader-overlay" style="display:none;">
@@ -912,7 +1095,14 @@ function api_products_list_page() {
         </div>
 
         <div style="background:#fff;padding:8px 15px;margin:8px 0;box-shadow:0 1px 3px rgba(0,0,0,0.1);display:flex;justify-content:space-between;align-items:center;">
-            <p style="margin:0;"><strong>Total : <?php echo $total_items; ?> produits</strong> | Page <?php echo $paged; ?> sur <?php echo $total_pages; ?></p>
+            <p style="margin:0;">
+                <strong>Total : <?php echo $total_items; ?> produits</strong> | Page <?php echo $paged; ?> sur <?php echo $total_pages; ?>
+                <?php if ($showing_sync): ?>
+                    <span style="background:#2271b1;color:white;padding:3px 10px;border-radius:3px;margin-left:10px;font-size:12px;">
+                        🔄 Produits synchronisés
+                    </span>
+                <?php endif; ?>
+            </p>
             <button type="button" id="start-import" class="button button-primary" style="font-weight:600;">
                 <span id="import-btn-text">✅ Importer</span>
             </button>
@@ -1029,6 +1219,26 @@ function api_products_list_page() {
 
     <script>
     jQuery(document).ready(function($){
+        // Bouton Effacer les produits synchronisés
+        $('#clear-sync').on('click', function() {
+            if (!confirm('Effacer les produits synchronisés de la liste ?')) {
+                return;
+            }
+            
+            $.ajax({
+                url: ajaxurl,
+                type: 'POST',
+                data: {
+                    action: 'api_mark_products_seen'
+                },
+                success: function(response) {
+                    if (response.success) {
+                        location.reload();
+                    }
+                }
+            });
+        });
+
         // Fonction pour mettre à jour le label du bouton d'import
         function updateImportButton() {
             var existCount = 0;
