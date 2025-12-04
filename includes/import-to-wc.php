@@ -1,16 +1,16 @@
 <?php
 /**
- * Module : Importation vers WooCommerce (Nouvelle page v7.2)
+ * Module : Importation vers WooCommerce (v7.3 - Avec gestion produits supprimés)
+ * 
+ * MODIFICATIONS v7.3 :
+ * - Affichage visuel des produits supprimés (is_deleted = 1)
+ * - Nouveau filtre "Statut suppression"
+ * - Gestion du nouveau format de retour de api_create_woocommerce_product_full()
+ * - Affichage des raisons d'échec détaillées
+ * - Avertissement avant import de produits supprimés
  * 
  * Cette page permet d'importer les produits DEPUIS la table wp_imbretex_products
  * Les produits ont été synchronisés au préalable via la page "Synchronisation"
- * 
- * Fonctionnalités :
- * - Liste paginée des produits de la table
- * - Filtres avec dropdowns (Marque, Catégorie)
- * - Filtres texte (SKU, Nom)
- * - Import vers WooCommerce
- * - Pas de filtres API (utilise uniquement la base)
  */
 
 if (!defined('ABSPATH')) exit;
@@ -20,17 +20,17 @@ if (!defined('ABSPATH')) exit;
 // ============================================================
 add_action('admin_menu', function() {
     add_submenu_page(
-        'api-products-list',           // Parent (page Import Direct)
-        'Importation vers WooCommerce', // Titre page
-        '➡️ Import vers WC',            // Titre menu
+        'api-products-list',
+        'Importation vers WooCommerce',
+        '➡️ Import vers WC',
         'manage_woocommerce',
-        'api-import-to-wc',             // Slug
-        'api_import_to_wc_page'         // Fonction callback
+        'api-import-to-wc',
+        'api_import_to_wc_page'
     );
 }, 11);
 
 // ============================================================
-// FONCTIONS BASE DE DONNÉES
+// FONCTIONS BASE DE DONNÉES (MODIFIÉES)
 // ============================================================
 
 // Récupérer les produits avec filtres et pagination
@@ -75,6 +75,12 @@ function api_db_get_products_filtered($filters = [], $limit = 10, $offset = 0) {
     if (isset($filters['imported']) && $filters['imported'] !== '') {
         $where[] = 'imported = %d';
         $params[] = intval($filters['imported']);
+    }
+    
+    // NOUVEAU : Filtre is_deleted
+    if (isset($filters['is_deleted']) && $filters['is_deleted'] !== '') {
+        $where[] = 'is_deleted = %d';
+        $params[] = intval($filters['is_deleted']);
     }
     
     $where_clause = implode(' AND ', $where);
@@ -130,6 +136,12 @@ function api_db_count_products_filtered($filters = []) {
         $params[] = intval($filters['imported']);
     }
     
+    // NOUVEAU : Filtre is_deleted
+    if (isset($filters['is_deleted']) && $filters['is_deleted'] !== '') {
+        $where[] = 'is_deleted = %d';
+        $params[] = intval($filters['is_deleted']);
+    }
+    
     $where_clause = implode(' AND ', $where);
     
     $query = "SELECT COUNT(*) FROM $table_name WHERE $where_clause";
@@ -173,7 +185,7 @@ function api_db_get_product_by_id($id) {
 }
 
 // ============================================================
-// AJAX : IMPORTER UN PRODUIT DEPUIS LA BASE
+// AJAX : IMPORTER UN PRODUIT (MODIFIÉ)
 // ============================================================
 add_action('wp_ajax_api_import_product_from_db', function() {
     check_ajax_referer('api_import_wc_nonce', 'nonce');
@@ -188,6 +200,16 @@ add_action('wp_ajax_api_import_product_from_db', function() {
         return;
     }
     
+    // NOUVELLE VÉRIFICATION : Produit supprimé
+    if ($product_db['is_deleted'] == 1) {
+        wp_send_json_error([
+            'message' => 'Produit marqué comme supprimé (is_deleted = 1)',
+            'reason' => 'deleted',
+            'sku' => $product_db['sku']
+        ]);
+        return;
+    }
+    
     // Décoder le product_data JSON
     $product_data = json_decode($product_db['product_data'], true);
     
@@ -197,32 +219,68 @@ add_action('wp_ajax_api_import_product_from_db', function() {
     }
     
     try {
-        // Utiliser la fonction d'import existante
-        $wc_product_id = api_create_woocommerce_product_full($product_data, null);
+        // Utiliser la fonction d'import (nouveau format de retour)
+        $result = api_create_woocommerce_product_full($product_data, null);
         
-        if ($wc_product_id) {
-            // Mettre à jour le statut dans la base
-            global $wpdb;
-            $table_name = $wpdb->prefix . 'imbretex_products';
-            
-            $wpdb->update(
-                $table_name,
-                [
-                    'imported' => 1,
-                    'wc_product_id' => $wc_product_id
-                ],
-                ['id' => $product_id],
-                ['%d', '%d'],
-                ['%d']
-            );
-            
-            wp_send_json_success([
-                'sku' => $product_db['sku'],
-                'name' => $product_db['name'],
-                'wc_product_id' => $wc_product_id
-            ]);
+        // Gérer le nouveau format de retour
+        if (is_array($result)) {
+            if ($result['success']) {
+                $wc_product_id = $result['product_id'];
+                
+                // Mettre à jour le statut dans la base
+                global $wpdb;
+                $table_name = $wpdb->prefix . 'imbretex_products';
+                
+                $wpdb->update(
+                    $table_name,
+                    [
+                        'imported' => 1,
+                        'wc_product_id' => $wc_product_id
+                    ],
+                    ['id' => $product_id],
+                    ['%d', '%d'],
+                    ['%d']
+                );
+                
+                wp_send_json_success([
+                    'sku' => $product_db['sku'],
+                    'name' => $product_db['name'],
+                    'wc_product_id' => $wc_product_id,
+                    'type' => $result['type'] ?? 'unknown'
+                ]);
+            } else {
+                // Échec avec raison
+                wp_send_json_error([
+                    'message' => $result['message'] ?? 'Échec création produit',
+                    'reason' => $result['reason'] ?? 'unknown',
+                    'sku' => $result['sku'] ?? $product_db['sku']
+                ]);
+            }
         } else {
-            wp_send_json_error(['message' => 'Échec création produit WooCommerce']);
+            // Format ancien (ID seulement) - retrocompatibilité
+            if ($result) {
+                global $wpdb;
+                $table_name = $wpdb->prefix . 'imbretex_products';
+                
+                $wpdb->update(
+                    $table_name,
+                    [
+                        'imported' => 1,
+                        'wc_product_id' => $result
+                    ],
+                    ['id' => $product_id],
+                    ['%d', '%d'],
+                    ['%d']
+                );
+                
+                wp_send_json_success([
+                    'sku' => $product_db['sku'],
+                    'name' => $product_db['name'],
+                    'wc_product_id' => $result
+                ]);
+            } else {
+                wp_send_json_error(['message' => 'Échec création produit WooCommerce']);
+            }
         }
     } catch (Exception $e) {
         wp_send_json_error(['message' => $e->getMessage()]);
@@ -230,7 +288,7 @@ add_action('wp_ajax_api_import_product_from_db', function() {
 });
 
 // ============================================================
-// PAGE ADMIN
+// PAGE ADMIN (MODIFIÉE)
 // ============================================================
 function api_import_to_wc_page() {
     // Récupérer les filtres
@@ -238,6 +296,7 @@ function api_import_to_wc_page() {
     $filter_name = $_GET['filter_name'] ?? '';
     $filter_brand = $_GET['filter_brand'] ?? '';
     $filter_category = $_GET['filter_category'] ?? '';
+    $filter_is_deleted = $_GET['filter_is_deleted'] ?? ''; // NOUVEAU
     
     // Pagination
     $items_per_page = intval($_GET['items_per_page'] ?? 20);
@@ -249,6 +308,7 @@ function api_import_to_wc_page() {
     if ($filter_name) $filters['name'] = $filter_name;
     if ($filter_brand) $filters['brand'] = $filter_brand;
     if ($filter_category) $filters['category'] = $filter_category;
+    if ($filter_is_deleted !== '') $filters['is_deleted'] = $filter_is_deleted;
     
     // Compter total
     $total_items = api_db_count_products_filtered($filters);
@@ -274,6 +334,7 @@ function api_import_to_wc_page() {
         'filter_name' => $filter_name,
         'filter_brand' => $filter_brand,
         'filter_category' => $filter_category,
+        'filter_is_deleted' => $filter_is_deleted,
         'items_per_page' => $items_per_page
     ];
     
@@ -281,15 +342,16 @@ function api_import_to_wc_page() {
     <div class="wrap">
         <h1>➡️ Importation vers WooCommerce</h1>
         
-        <!-- Statistiques rapides -->
+        <!-- Statistiques rapides (MODIFIÉES) -->
         <?php
-        $stats_total = api_db_count_products_filtered([]);
-        $stats_imported = api_db_count_products_filtered(['imported' => 1]);
-        $stats_not_imported = api_db_count_products_filtered(['imported' => 0]);
+        $stats_total = api_db_count_products_filtered(['is_deleted' => 0]);
+        $stats_imported = api_db_count_products_filtered(['imported' => 1, 'is_deleted' => 0]);
+        $stats_not_imported = api_db_count_products_filtered(['imported' => 0, 'is_deleted' => 0]);
+        $stats_deleted = api_db_count_products_filtered(['is_deleted' => 1]);
         ?>
-        <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:15px;margin:20px 0;">
+        <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:15px;margin:20px 0;">
             <div style="background:#fff;padding:15px;box-shadow:0 1px 3px rgba(0,0,0,0.1);border-left:4px solid #2271b1;">
-                <h3 style="margin:0 0 5px 0;color:#2271b1;font-size:14px;">📦 Total Produits</h3>
+                <h3 style="margin:0 0 5px 0;color:#2271b1;font-size:14px;">📦 Produits Actifs</h3>
                 <p style="font-size:28px;margin:0;font-weight:bold;"><?php echo number_format($stats_total); ?></p>
             </div>
             <div style="background:#fff;padding:15px;box-shadow:0 1px 3px rgba(0,0,0,0.1);border-left:4px solid #46b450;">
@@ -300,15 +362,19 @@ function api_import_to_wc_page() {
                 <h3 style="margin:0 0 5px 0;color:#dc3232;font-size:14px;">⏳ À Importer</h3>
                 <p style="font-size:28px;margin:0;font-weight:bold;"><?php echo number_format($stats_not_imported); ?></p>
             </div>
+            <div style="background:#fff;padding:15px;box-shadow:0 1px 3px rgba(0,0,0,0.1);border-left:4px solid #826eb4;">
+                <h3 style="margin:0 0 5px 0;color:#826eb4;font-size:14px;">🗑️ Supprimés</h3>
+                <p style="font-size:28px;margin:0;font-weight:bold;"><?php echo number_format($stats_deleted); ?></p>
+            </div>
         </div>
         
-        <!-- FILTRES -->
+        <!-- FILTRES (MODIFIÉS) -->
         <div style="background:#fff;padding:15px;margin:10px 0;box-shadow:0 1px 3px rgba(0,0,0,0.1);">
             <h3 style="margin:0 0 10px 0;color:#2271b1;font-size:16px;">🔍 Filtres</h3>
             <form method="get" action="">
                 <input type="hidden" name="page" value="api-import-to-wc">
                 
-                <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px;margin-bottom:15px;">
+                <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;margin-bottom:15px;">
                     <!-- SKU -->
                     <div>
                         <label style="font-size:12px;font-weight:600;display:block;margin-bottom:5px;">SKU</label>
@@ -327,7 +393,7 @@ function api_import_to_wc_page() {
                     <div>
                         <label style="font-size:12px;font-weight:600;display:block;margin-bottom:5px;">Marque</label>
                         <select name="filter_brand" style="width:100%;height:32px;">
-                            <option value="">-- Toutes les marques --</option>
+                            <option value="">-- Toutes --</option>
                             <?php foreach ($all_brands as $brand): ?>
                                 <option value="<?php echo esc_attr($brand); ?>" <?php selected($filter_brand, $brand); ?>>
                                     <?php echo esc_html($brand); ?>
@@ -340,12 +406,22 @@ function api_import_to_wc_page() {
                     <div>
                         <label style="font-size:12px;font-weight:600;display:block;margin-bottom:5px;">Catégorie</label>
                         <select name="filter_category" style="width:100%;height:32px;">
-                            <option value="">-- Toutes les catégories --</option>
+                            <option value="">-- Toutes --</option>
                             <?php foreach ($all_categories as $category): ?>
                                 <option value="<?php echo esc_attr($category); ?>" <?php selected($filter_category, $category); ?>>
                                     <?php echo esc_html($category); ?>
                                 </option>
                             <?php endforeach; ?>
+                        </select>
+                    </div>
+                    
+                    <!-- NOUVEAU : Statut Suppression -->
+                    <div>
+                        <label style="font-size:12px;font-weight:600;display:block;margin-bottom:5px;">Statut</label>
+                        <select name="filter_is_deleted" style="width:100%;height:32px;">
+                            <option value="">-- Tous --</option>
+                            <option value="0" <?php selected($filter_is_deleted, '0'); ?>>✅ Actifs</option>
+                            <option value="1" <?php selected($filter_is_deleted, '1'); ?>>🗑️ Supprimés</option>
                         </select>
                     </div>
                     
@@ -416,7 +492,6 @@ function api_import_to_wc_page() {
             </div>
         </div>
         
-        <!-- Tableau produits -->
         <form method="post" id="import-form">
             <div id="products-table-wrapper">
                 <table class="wp-list-table widefat fixed striped">
@@ -443,16 +518,27 @@ function api_import_to_wc_page() {
                         <?php else: ?>
                             <?php foreach ($products as $product):
                                 $is_imported = $product['imported'] == 1;
+                                $is_deleted = $product['is_deleted'] == 1;
                                 $product_data = json_decode($product['product_data'], true);
                                 $variants_count = isset($product_data['variants']) ? count($product_data['variants']) : 0;
                                 $variants_json = json_encode($product_data, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE);
+                                
+                                $row_style = $is_deleted ? 'background:#fff0f0;opacity:0.7;' : '';
                             ?>
-                            <tr>
+                            <tr style="<?php echo $row_style; ?>">
                                 <td>
                                     <input type="checkbox" name="product_ids[]" value="<?php echo $product['id']; ?>" 
-                                           class="product-checkbox" data-imported="<?php echo $is_imported ? '1' : '0'; ?>">
+                                           class="product-checkbox" 
+                                           data-imported="<?php echo $is_imported ? '1' : '0'; ?>"
+                                           data-deleted="<?php echo $is_deleted ? '1' : '0'; ?>"
+                                           <?php echo $is_deleted ? 'disabled title="Produit supprimé - Import impossible"' : ''; ?>>
                                 </td>
-                                <td><?php echo esc_html($product['sku']); ?></td>
+                                <td>
+                                    <?php echo esc_html($product['sku']); ?>
+                                    <?php if ($is_deleted): ?>
+                                        <br><span style="color:#d63638;font-size:11px;font-weight:600;">🗑️ SUPPRIMÉ</span>
+                                    <?php endif; ?>
+                                </td>
                                 <td><?php echo esc_html($product['name']); ?></td>
                                 <td><?php echo esc_html($product['brand']); ?></td>
                                 <td><?php echo esc_html($product['category']); ?></td>
@@ -462,7 +548,12 @@ function api_import_to_wc_page() {
                                     </span>
                                 </td>
                                 <td>
-                                    <?php if ($product['status'] === 'new'): ?>
+                                    <?php if ($is_deleted): ?>
+                                        <span style="color:#d63638;font-weight:600;">🗑️ Supprimé</span>
+                                        <?php if ($product['deleted_at']): ?>
+                                            <br><small style="color:#999;"><?php echo date('d/m/Y', strtotime($product['deleted_at'])); ?></small>
+                                        <?php endif; ?>
+                                    <?php elseif ($product['status'] === 'new'): ?>
                                         <span style="color:#2271b1;">🆕 Nouveau</span>
                                     <?php else: ?>
                                         <span style="color:#f0b849;">🔄 MAJ</span>
@@ -528,35 +619,43 @@ function api_import_to_wc_page() {
     
     <script>
     jQuery(document).ready(function($){
-        // Mise à jour du bouton d'import
         function updateImportButton() {
             var importedCount = 0;
             var notImportedCount = 0;
+            var deletedCount = 0;
             
             $('.product-checkbox:checked').each(function() {
-                if ($(this).data('imported') == '1') {
+                if ($(this).data('deleted') == '1') {
+                    deletedCount++;
+                } else if ($(this).data('imported') == '1') {
                     importedCount++;
                 } else {
                     notImportedCount++;
                 }
             });
             
-            var totalChecked = importedCount + notImportedCount;
+            var totalChecked = importedCount + notImportedCount + deletedCount;
             
             if (totalChecked === 0) {
                 $('#import-btn-text').html('✅ Importer vers WooCommerce');
+                $('#start-import').prop('disabled', false);
+            } else if (deletedCount > 0) {
+                $('#import-btn-text').html('⚠️ ' + deletedCount + ' produit(s) supprimé(s) sélectionné(s)');
+                $('#start-import').prop('disabled', true);
             } else if (notImportedCount > 0 && importedCount > 0) {
                 $('#import-btn-text').html('✅ Importer/Mettre à jour (' + totalChecked + ')');
+                $('#start-import').prop('disabled', false);
             } else if (importedCount > 0 && notImportedCount === 0) {
                 $('#import-btn-text').html('🔄 Mettre à jour (' + totalChecked + ')');
+                $('#start-import').prop('disabled', false);
             } else {
                 $('#import-btn-text').html('➕ Importer (' + totalChecked + ')');
+                $('#start-import').prop('disabled', false);
             }
         }
         
-        // Sélection checkboxes
         $('#select-all').on('change', function() {
-            $('.product-checkbox').prop('checked', $(this).prop('checked'));
+            $('.product-checkbox:not(:disabled)').prop('checked', $(this).prop('checked'));
             updateImportButton();
         });
         
@@ -603,10 +702,10 @@ function api_import_to_wc_page() {
             }
         });
         
-        // IMPORT AJAX
+        // IMPORT AJAX (MODIFIÉ - gestion nouveau format)
         $('#start-import').on('click', function() {
             var selectedIds = [];
-            $('.product-checkbox:checked').each(function() {
+            $('.product-checkbox:checked:not(:disabled)').each(function() {
                 selectedIds.push(parseInt($(this).val()));
             });
 
@@ -664,12 +763,26 @@ function api_import_to_wc_page() {
                             imported++;
                         } else {
                             errors++;
-                            errorMessages.push('ID ' + productId + ': ' + (response.data.message || 'Erreur inconnue'));
+                            var errorMsg = 'ID ' + productId;
+                            if (response.data.sku) {
+                                errorMsg = 'SKU ' + response.data.sku;
+                            }
+                            
+                            // Ajouter la raison d'échec
+                            if (response.data.reason === 'deleted') {
+                                errorMsg += ' : 🗑️ Produit supprimé';
+                            } else if (response.data.message) {
+                                errorMsg += ' : ' + response.data.message;
+                            } else {
+                                errorMsg += ' : Erreur inconnue';
+                            }
+                            
+                            errorMessages.push(errorMsg);
                         }
                     },
                     error: function() {
                         errors++;
-                        errorMessages.push('ID ' + productId + ': Erreur réseau');
+                        errorMessages.push('ID ' + productId + ' : Erreur réseau');
                     },
                     complete: function() {
                         importNext(index + 1);
