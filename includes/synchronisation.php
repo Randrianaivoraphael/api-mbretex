@@ -307,6 +307,101 @@ function api_reset_all_sync_states() {
     return $wpdb->query("TRUNCATE TABLE $table_name");
 }
 
+// ============================================================
+// FONCTIONS DE GESTION DE LA TABLE PRODUITS
+// ============================================================
+
+/* function api_db_upsert_product($product_data) {
+    global $wpdb;
+    $table_name = $wpdb->prefix . 'imbretex_products';
+    
+    $variant = $product_data['variants'][0] ?? null;
+    if (!$variant) return false;
+    
+    $is_variable = count($product_data['variants']) > 1;
+    
+    if ($is_variable) {
+        error_log("API Imbretex - Produit variable détecté pour référence {$product_data['reference']}");
+        error_log("API Imbretex - Référence variable utilisée : {$variant['variantReference']}");
+        $main_reference = $variant['variantReference'];
+    } else {
+        $main_reference = $variant['variantReference'] ?? $product_data['reference'];
+    }
+    
+    $category = 'Autres';
+    if (!empty($variant['categories']) && is_array($variant['categories'])) {
+        $first_cat = $variant['categories'][0];
+        if (isset($first_cat['categories']['fr'])) {
+            $category = $first_cat['categories']['fr'];
+        } elseif (isset($first_cat['families']['fr'])) {
+            $category = $first_cat['families']['fr'];
+        }
+    }
+    
+    $price_stock = api_get_product_price_stock($main_reference);
+    $price = isset($price_stock['price']) ? floatval($price_stock['price']) : 0;
+    error_log("API Imbretex - Prix et stock pour référence $main_reference : Prix = $price");
+    $stock = 0;
+    if (isset($price_stock['stock'])) {
+        $stock += intval($price_stock['stock']);
+    }
+    if (isset($price_stock['stock_supplier'])) {
+        $stock += intval($price_stock['stock_supplier']);
+    }
+    
+    $image_url = '';
+    if (!empty($variant['images']) && is_array($variant['images'])) {
+        $first_image = $variant['images'][0];
+        if (is_string($first_image)) {
+            $image_url = $first_image;
+        } elseif (is_array($first_image) && isset($first_image['url'])) {
+            $image_url = $first_image['url'];
+        }
+    }
+    
+    $existing = $wpdb->get_row($wpdb->prepare(
+        "SELECT * FROM $table_name WHERE sku = %s",
+        $main_reference
+    ));
+    
+    $data = [
+        'sku' => $main_reference,
+        'reference' => $main_reference,
+        'name' => $variant['title']['fr'] ?? $main_reference,
+        'brand' => $product_data['brands']['name'] ?? '',
+        'category' => $category,
+        'variants_count' => count($product_data['variants']),
+        'price' => $price,
+        'stock' => $stock,
+        'image_url' => $image_url,
+        'created_at' => $product_data['createdAt'],
+        'updated_at' => $product_data['updatedAt'],
+        'synced_at' => current_time('mysql'),
+        'product_data' => json_encode($product_data),
+        'status' => $existing ? 'updated' : 'new',
+        'is_deleted' => 0,
+        'deleted_at' => null
+    ];
+    
+    if ($existing) {
+        $wpdb->update(
+            $table_name,
+            $data,
+            ['sku' => $main_reference],
+            ['%s', '%s', '%s', '%s', '%s', '%d', '%f', '%d', '%s', '%s', '%s', '%s', '%s', '%s', '%d', '%s'],
+            ['%s']
+        );
+        return ['id' => $existing->id, 'is_new' => false];
+    } else {
+        $wpdb->insert(
+            $table_name,
+            $data,
+            ['%s', '%s', '%s', '%s', '%s', '%d', '%f', '%d', '%s', '%s', '%s', '%s', '%s', '%s', '%d', '%s']
+        );
+        return ['id' => $wpdb->insert_id, 'is_new' => true];
+    }
+} */
+
 function api_db_upsert_product($product_data) {
     global $wpdb;
     $table_name = $wpdb->prefix . 'imbretex_products';
@@ -334,22 +429,27 @@ function api_db_upsert_product($product_data) {
         }
     }
     
+    // ✅ NOUVEAU : Récupérer et ajouter le prix pour CHAQUE variante dans le JSON
     if (isset($product_data['variants']) && is_array($product_data['variants'])) {
         foreach ($product_data['variants'] as $index => &$variant_item) {
             $variant_reference = $variant_item['variantReference'] ?? null;
             
             if ($variant_reference) {
+                // Récupérer le prix et stock via l'API
                 $price_stock = api_get_product_price_stock($variant_reference);
                 
                 if ($price_stock && isset($price_stock['price'])) {
+                    // Ajouter le prix dans l'objet de la variante
                     $variant_item['price'] = floatval($price_stock['price']);
                     
                     error_log("API Imbretex - Prix ajouté pour variante {$variant_reference}: {$variant_item['price']}€");
                 } else {
+                    // Si pas de prix trouvé, mettre 0
                     $variant_item['price'] = 0;
                     error_log("API Imbretex - Aucun prix trouvé pour variante {$variant_reference}");
                 }
                 
+                // Optionnel : Ajouter aussi le stock si besoin
                 if ($price_stock && isset($price_stock['stock'])) {
                     $variant_item['stock'] = intval($price_stock['stock']);
                     
@@ -362,8 +462,10 @@ function api_db_upsert_product($product_data) {
         unset($variant_item);
     }
     
+    // Récupérer le prix de la référence principale pour la table (compatibilité)
     $price_stock = api_get_product_price_stock($main_reference);
     $price = isset($price_stock['price']) ? floatval($price_stock['price']) : 0;
+    error_log("API Imbretex - Prix principal pour référence $main_reference : Prix = $price");
     
     $stock = 0;
     if (isset($price_stock['stock'])) {

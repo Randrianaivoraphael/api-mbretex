@@ -2,10 +2,6 @@
 
 if (!defined('ABSPATH')) exit;
 
-// ============================================================
-// FONCTIONS POUR GÉRER LE PROGRÈS (TRANSIENTS)
-// ============================================================
-
 function api_get_progress() {
     $progress = get_transient('api_import_progress');
     if (!$progress) {
@@ -27,50 +23,59 @@ function api_set_progress($variants_current, $variants_total, $products_current,
         'products_total' => $products_total
     ];
     set_transient('api_import_progress', $progress, 3600);
-    error_log("API v11.0 - Progress saved: {$variants_current}/{$variants_total} variants, {$products_current}/{$products_total} products");
 }
 
 function api_increment_variant() {
     $progress = api_get_progress();
     $progress['variants_current']++;
     set_transient('api_import_progress', $progress, 3600);
-    error_log("API v11.0 - Variant incremented: {$progress['variants_current']}/{$progress['variants_total']}");
 }
 
 function api_increment_product() {
     $progress = api_get_progress();
     $progress['products_current']++;
     set_transient('api_import_progress', $progress, 3600);
-    error_log("API v11.0 - Product incremented: {$progress['products_current']}/{$progress['products_total']}");
 }
 
 function api_reset_progress() {
     delete_transient('api_import_progress');
-    error_log("API v11.0 - Progress reset");
 }
-
-// ============================================================
-// FONCTIONS HELPER INTÉGRÉES
-// ============================================================
 
 function api_download_and_attach_image_local($image_url, $product_id = 0) {
     global $wpdb;
     if (!$image_url) return null;
     
     $image_url = esc_url_raw($image_url);
-    $existing = $wpdb->get_var($wpdb->prepare("SELECT ID FROM {$wpdb->posts} WHERE guid=%s", $image_url));
-    if ($existing) return intval($existing);
-
+    
+    $existing = $wpdb->get_var($wpdb->prepare(
+        "SELECT ID FROM {$wpdb->posts} 
+        WHERE guid=%s OR post_name=%s 
+        LIMIT 1", 
+        $image_url,
+        sanitize_title(basename(parse_url($image_url, PHP_URL_PATH)))
+    ));
+    
+    if ($existing) {
+        return intval($existing);
+    }
+    
     $tmp = download_url($image_url);
-    if (is_wp_error($tmp)) return null;
+    if (is_wp_error($tmp)) {
+        return null;
+    }
 
-    $file_array = ['name' => basename(parse_url($image_url, PHP_URL_PATH)), 'tmp_name' => $tmp];
+    $file_array = [
+        'name' => basename(parse_url($image_url, PHP_URL_PATH)), 
+        'tmp_name' => $tmp
+    ];
+    
     $id = media_handle_sideload($file_array, $product_id);
     
     if (is_wp_error($id)) {
         @unlink($tmp);
         return null;
     }
+    
     return $id;
 }
 
@@ -108,10 +113,6 @@ function api_ensure_global_attributes_local() {
     }
 }
 
-/**
- * Crée les attributs d'un produit simple (Taille, Couleur, Matière)
- * Ces attributs sont non-variables, juste pour affichage
- */
 function api_create_product_attributes($variant, $for_variation = false) {
     $attributes = [];
     
@@ -162,10 +163,6 @@ function api_create_product_attributes($variant, $for_variation = false) {
     return $attributes;
 }
 
-// ============================================================
-// FONCTION DE CRÉATION DE PRODUITS INTÉGRÉE
-// ============================================================
-
 function api_create_woocommerce_product_full($product_api_data, $price_stock_data = null) {
     
     if (!function_exists('wc_get_product')) return false;
@@ -181,8 +178,6 @@ function api_create_woocommerce_product_full($product_api_data, $price_stock_dat
     $main_reference = $is_variable 
         ? ($product_api_data['reference'] ?? $first_variant['variantReference'])
         : ($first_variant['variantReference'] ?? $product_api_data['reference']);
-
-    error_log("API v11.0 - Creating product: {$main_reference}, variable=" . ($is_variable ? 'yes' : 'no'));
 
     $product_id = wc_get_product_id_by_sku($main_reference);
     
@@ -211,7 +206,6 @@ function api_create_woocommerce_product_full($product_api_data, $price_stock_dat
         $product->set_short_description($first_variant['description']['fr']);
     }
 
-    // Catégories
     $category_ids = [];
     if (!empty($first_variant['categories']) && is_array($first_variant['categories'])) {
         foreach ($first_variant['categories'] as $cat_data) {
@@ -234,7 +228,6 @@ function api_create_woocommerce_product_full($product_api_data, $price_stock_dat
     
     if (!empty($category_ids)) $product->set_category_ids($category_ids);
 
-    // Tags
     $tag_names = [];
     if (!empty($first_variant['tags']) && is_array($first_variant['tags'])) {
         foreach ($first_variant['tags'] as $tag) {
@@ -261,7 +254,6 @@ function api_create_woocommerce_product_full($product_api_data, $price_stock_dat
         $product->set_tag_ids($tag_ids);
     }
 
-    // Meta données
     if (!empty($first_variant['characteristics']['genders'])) {
         $product->update_meta_data('_gender', implode(', ', $first_variant['characteristics']['genders']));
     }
@@ -278,7 +270,6 @@ function api_create_woocommerce_product_full($product_api_data, $price_stock_dat
         $product->update_meta_data('_long_title', $first_variant['longTitle']['fr']);
     }
 
-    // Images
     if (!empty($first_variant['images']) && is_array($first_variant['images'])) {
         $attachment_ids = [];
         foreach ($first_variant['images'] as $image_data) {
@@ -299,16 +290,11 @@ function api_create_woocommerce_product_full($product_api_data, $price_stock_dat
     try {
         $product_id = $product->save();
     } catch (Exception $e) {
-        error_log('API Imbretex v11.0 - Erreur sauvegarde produit : ' . $e->getMessage());
         return false;
     }
 
-    // ============================================================
-    // PRODUIT SIMPLE
-    // ============================================================
     if (!$is_variable) {
         api_increment_variant();
-        error_log("API v11.0 - Simple product, incremented variant counter");
         
         $regular_price = floatval($product_api_data['regular_price'] ?? $product_api_data['price'] ?? $first_variant['price'] ?? 0);
         if ($regular_price > 0) {
@@ -317,7 +303,6 @@ function api_create_woocommerce_product_full($product_api_data, $price_stock_dat
             }
             $product->set_regular_price($regular_price);
             $product->set_price($regular_price);
-            error_log("API v11.0 - Price set: {$regular_price}€");
         }
 
         $total_stock = intval($product_api_data['stock_quantity'] ?? 0);
@@ -327,27 +312,19 @@ function api_create_woocommerce_product_full($product_api_data, $price_stock_dat
         $product->set_manage_stock(true);
         $product->set_stock_quantity($total_stock);
         $product->set_stock_status($total_stock > 0 ? 'instock' : 'outofstock');
-        error_log("API v11.0 - Stock set: {$total_stock}");
 
-        // ✅ Ajouter les attributs du produit simple (Taille, Couleur, Matière)
         $attributes = api_create_product_attributes($first_variant, false);
         if (!empty($attributes)) {
             $product->set_attributes($attributes);
-            error_log("API v11.0 - Simple product attributes set: " . count($attributes));
         }
 
         $product->save();
-        error_log("API v11.0 - Simple product saved: {$product_id}");
         return $product_id;
     }
     
-    // ============================================================
-    // PRODUIT VARIABLE
-    // ============================================================
     $margin_percent = floatval($product_api_data['applied_margin'] ?? 0);
     $category_name = $product_api_data['category_name'] ?? '';
     
-    // Créer les attributs globaux pour variations (Taille, Couleur)
     $all_sizes = [];
     $all_colors = [];
     $all_materials = [];
@@ -372,7 +349,6 @@ function api_create_woocommerce_product_full($product_api_data, $price_stock_dat
     
     $attributes = [];
     
-    // Attribut Taille (pour variations)
     if (!empty($all_sizes)) {
         $attribute = new WC_Product_Attribute();
         $attribute->set_id(wc_attribute_taxonomy_id_by_name('pa_taille'));
@@ -383,7 +359,6 @@ function api_create_woocommerce_product_full($product_api_data, $price_stock_dat
         $attributes[] = $attribute;
     }
     
-    // Attribut Couleur (pour variations)
     if (!empty($all_colors)) {
         $attribute = new WC_Product_Attribute();
         $attribute->set_id(wc_attribute_taxonomy_id_by_name('pa_couleur'));
@@ -394,34 +369,39 @@ function api_create_woocommerce_product_full($product_api_data, $price_stock_dat
         $attributes[] = $attribute;
     }
     
-    // Attribut Matière (pour affichage uniquement, pas pour variations)
     if (!empty($all_materials)) {
         $attribute = new WC_Product_Attribute();
         $attribute->set_name('Matière');
         $attribute->set_options(array_values($all_materials));
         $attribute->set_visible(true);
-        $attribute->set_variation(false); // Non utilisé pour les variations
+        $attribute->set_variation(false);
         $attributes[] = $attribute;
-        error_log("API v11.0 - Material attribute added: " . implode(', ', $all_materials));
     }
     
     if (!empty($attributes)) {
         $product->set_attributes($attributes);
         $product->save();
-        error_log("API v11.0 - Variable product attributes saved: " . count($attributes) . " attributes");
     }
 
-    // ============================================================
-    // CRÉER LES VARIATIONS AVEC MISE À JOUR DU COMPTEUR
-    // ============================================================
-    error_log("API v11.0 - Creating " . count($variants) . " variations");
+    $variant_images_cache = [];
+    
+    foreach ($variants as $variant) {
+        if (!empty($variant['images'][0])) {
+            $image_url = is_string($variant['images'][0]) ? $variant['images'][0] : ($variant['images'][0]['url'] ?? null);
+            if ($image_url && !isset($variant_images_cache[$image_url])) {
+                $attachment_id = api_download_and_attach_image_local($image_url, $product_id);
+                if ($attachment_id) {
+                    $variant_images_cache[$image_url] = $attachment_id;
+                }
+            }
+        }
+    }
+    
     foreach ($variants as $variant_index => $variant) {
         $variant_sku = $variant['variantReference'] ?? '';
         if (!$variant_sku) continue;
         
-        // ✅ Incrément du compteur via transient
         api_increment_variant();
-        error_log("API v11.0 - Processing variant " . ($variant_index + 1) . "/" . count($variants) . ": {$variant_sku}");
         
         $variation_id = wc_get_product_id_by_sku($variant_sku);
         $variation = $variation_id ? new WC_Product_Variation($variation_id) : new WC_Product_Variation();
@@ -429,7 +409,6 @@ function api_create_woocommerce_product_full($product_api_data, $price_stock_dat
         
         $variation->set_sku($variant_sku);
         
-        // Attributs
         $variation_attributes = [];
         if (!empty($variant['attributes']) && is_array($variant['attributes'])) {
             foreach ($variant['attributes'] as $attr) {
@@ -445,17 +424,13 @@ function api_create_woocommerce_product_full($product_api_data, $price_stock_dat
         }
         $variation->set_attributes($variation_attributes);
 
-        // Image
         if (!empty($variant['images'][0])) {
             $image_url = is_string($variant['images'][0]) ? $variant['images'][0] : ($variant['images'][0]['url'] ?? null);
-            if ($image_url) {
-                $attachment_id = api_download_and_attach_image_local($image_url, $product_id);
-                if ($attachment_id) $variation->set_image_id($attachment_id);
+            if ($image_url && isset($variant_images_cache[$image_url])) {
+                $variation->set_image_id($variant_images_cache[$image_url]);
             }
         }
-        error_log("image set for variation: {$image_url}");
 
-        // Prix
         $regular_price = floatval($variant['regular_price'] ?? $variant['price'] ?? 0);
         if ($regular_price > 0) {
             if ($margin_percent > 0 && $category_name && function_exists('api_calculate_price_with_margin')) {
@@ -468,7 +443,6 @@ function api_create_woocommerce_product_full($product_api_data, $price_stock_dat
             $variation->set_price($regular_price);
         }
 
-        // Stock
         $total_stock = intval($variant['stock_quantity'] ?? 0);
         if ($total_stock == 0) {
             $total_stock = intval($variant['stock'] ?? 0) + intval($variant['stock_supplier'] ?? 0);
@@ -478,17 +452,11 @@ function api_create_woocommerce_product_full($product_api_data, $price_stock_dat
         $variation->set_stock_status($total_stock > 0 ? 'instock' : 'outofstock');
 
         $variation->save();
-        error_log("API v11.0 - Variation saved: {$variant_sku} (ID: {$variation->get_id()})");
     }
 
     WC_Product_Variable::sync($product_id);
-    error_log("API v11.0 - Variable product synced: {$product_id}");
     return $product_id;
 }
-
-// ============================================================
-// MENU ET FONCTIONS DB
-// ============================================================
 
 add_action('admin_menu', function() {
     add_submenu_page(
@@ -635,10 +603,6 @@ function api_db_get_product_by_id($id) {
     return $wpdb->get_row($wpdb->prepare("SELECT * FROM $table_name WHERE id = %d", $id), ARRAY_A);
 }
 
-// ============================================================
-// ENDPOINTS AJAX
-// ============================================================
-
 add_action('wp_ajax_api_get_variant_prices', function() {
     check_ajax_referer('api_import_wc_nonce', 'nonce');
     
@@ -718,18 +682,14 @@ add_action('wp_ajax_api_get_variant_prices', function() {
     ]);
 });
 
-// ✅ NOUVEAU : Endpoint pour récupérer le progrès en temps réel
 add_action('wp_ajax_api_get_import_progress', function() {
     check_ajax_referer('api_import_wc_nonce', 'nonce');
     
     $progress = api_get_progress();
     
-    error_log("API v11.0 - Progress requested: {$progress['variants_current']}/{$progress['variants_total']} variants");
-    
     wp_send_json_success($progress);
 });
 
-// ✅ NOUVEAU : Endpoint pour initialiser les variables de progrès
 add_action('wp_ajax_api_init_import_progress', function() {
     check_ajax_referer('api_import_wc_nonce', 'nonce');
     
@@ -737,8 +697,6 @@ add_action('wp_ajax_api_init_import_progress', function() {
     $total_products = intval($_POST['total_products'] ?? 0);
     
     api_set_progress(0, $total_variants, 0, $total_products);
-    
-    error_log("API v11.0 - Progress initialized: 0/{$total_variants} variants, 0/{$total_products} products");
     
     wp_send_json_success([
         'message' => 'Initialized',
@@ -751,20 +709,15 @@ add_action('wp_ajax_api_import_single_product', function() {
     check_ajax_referer('api_import_wc_nonce', 'nonce');
     
     $product_id = intval($_POST['product_id']);
-    error_log("API v11.0 - Import request for product ID: {$product_id}");
     
     $product_db = api_db_get_product_by_id($product_id);
     
     if (!$product_db) {
-        error_log("API v11.0 - Product not found: {$product_id}");
         wp_send_json_error(['message' => 'Produit non trouvé dans la base']);
         return;
     }
     
-    error_log("API v11.0 - Product found: {$product_db['sku']} - {$product_db['name']}");
-    
     if ($product_db['is_deleted'] == 1) {
-        error_log("API v11.0 - Product deleted: {$product_db['sku']}");
         wp_send_json_error([
             'message' => 'Produit marqué comme supprimé',
             'reason' => 'deleted',
@@ -775,7 +728,6 @@ add_action('wp_ajax_api_import_single_product', function() {
     
     $base_price = floatval($product_db['price']);
     if ($base_price <= 0) {
-        error_log("API v11.0 - No price: {$product_db['sku']}");
         wp_send_json_error([
             'message' => 'Prix invalide ou manquant',
             'reason' => 'no_price',
@@ -787,7 +739,6 @@ add_action('wp_ajax_api_import_single_product', function() {
     $product_data = json_decode($product_db['product_data'], true);
     
     if (!$product_data) {
-        error_log("API v11.0 - Invalid product data: {$product_db['sku']}");
         wp_send_json_error(['message' => 'Données produit invalides']);
         return;
     }
@@ -798,8 +749,6 @@ add_action('wp_ajax_api_import_single_product', function() {
         $margin_percent = api_get_category_margin($category);
     }
     
-    error_log("API v11.0 - Category: {$category}, Margin: {$margin_percent}%");
-    
     $wc_price = $base_price;
     if ($margin_percent > 0 && function_exists('api_calculate_price_with_margin')) {
         $wc_price = api_calculate_price_with_margin($base_price, $category);
@@ -808,8 +757,6 @@ add_action('wp_ajax_api_import_single_product', function() {
         }
     }
     
-    error_log("API v11.0 - Base price: {$base_price}€, Final price: {$wc_price}€");
-    
     $product_data['calculated_price'] = $wc_price;
     $product_data['base_price'] = $base_price;
     $product_data['applied_margin'] = $margin_percent;
@@ -817,9 +764,7 @@ add_action('wp_ajax_api_import_single_product', function() {
     $product_data['price'] = $wc_price;
     $product_data['regular_price'] = $wc_price;
     
-    // Préparer les variantes avec prix
     if (isset($product_data['variants']) && is_array($product_data['variants'])) {
-        error_log("API v11.0 - Preparing " . count($product_data['variants']) . " variants");
         foreach ($product_data['variants'] as $index => &$variant) {
             $variant_base_price = 0;
             
@@ -850,12 +795,10 @@ add_action('wp_ajax_api_import_single_product', function() {
     $variants_count = isset($product_data['variants']) ? count($product_data['variants']) : 1;
     
     try {
-        error_log("API v11.0 - Calling api_create_woocommerce_product_full");
         $result = api_create_woocommerce_product_full($product_data, null);
         
         if ($result) {
             api_increment_product();
-            error_log("API v11.0 - Product created successfully: WC ID {$result}");
             
             global $wpdb;
             $table_name = $wpdb->prefix . 'imbretex_products';
@@ -868,31 +811,24 @@ add_action('wp_ajax_api_import_single_product', function() {
                 ['%d']
             );
             
-            error_log("API v11.0 - Database updated for product: {$product_db['sku']}");
-            
             wp_send_json_success([
                 'sku' => $product_db['sku'],
                 'name' => $product_db['name'],
+                'brand' => $product_db['brand'],
+                'category' => $category,
                 'wc_product_id' => $result,
                 'variants_count' => $variants_count,
                 'base_price' => $base_price,
                 'final_price' => $wc_price,
-                'margin' => $margin_percent,
-                'category' => $category
+                'margin' => $margin_percent
             ]);
         } else {
-            error_log("API v11.0 - Failed to create product: {$product_db['sku']}");
             wp_send_json_error(['message' => 'Échec création produit WooCommerce']);
         }
     } catch (Exception $e) {
-        error_log("API v11.0 - Exception: " . $e->getMessage());
         wp_send_json_error(['message' => $e->getMessage()]);
     }
 });
-
-// ============================================================
-// PAGE D'INTERFACE
-// ============================================================
 
 function api_import_to_wc_page() {
     $filter_sku = $_GET['filter_sku'] ?? '';
@@ -936,7 +872,7 @@ function api_import_to_wc_page() {
     
     ?>
     <div class="wrap">
-        <h1>➡️ Importation vers WooCommerce <span style="font-size:14px;color:#666;">v11.0</span></h1>
+        <h1>➡️ Importation vers WooCommerce <span style="font-size:14px;color:#666;">v11.3 ⚡</span></h1>
         
         <?php if (!function_exists('api_get_category_margin')): ?>
         <div class="notice notice-warning" style="margin:15px 0;padding:12px;">
@@ -1052,7 +988,6 @@ function api_import_to_wc_page() {
             </button>
         </div>
         
-        <!-- Modal Prix des Variantes -->
         <div id="variants-prices-modal" style="display:none;">
             <div class="variants-prices-modal-content">
                 <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;border-bottom:2px solid #2271b1;padding-bottom:15px;">
@@ -1063,20 +998,32 @@ function api_import_to_wc_page() {
                     <button id="close-variants-prices-modal" class="button" style="font-size:20px;line-height:1;padding:5px 12px;">×</button>
                 </div>
                 
-                <div id="variants-prices-container" style="max-height:500px;overflow-y:auto;">
-                    <!-- Les variantes seront insérées ici -->
-                </div>
+                <div id="variants-prices-container" style="max-height:500px;overflow-y:auto;"></div>
             </div>
         </div>
         
-        <!-- Modal d'importation avec polling -->
         <div id="import-modal" style="display:none;">
             <div class="import-modal-content">
                 <div id="import-progress-view">
                     <h2 style="text-align:center;color:#2271b1;margin-bottom:30px;">📥 Importation en cours</h2>
                     
-                    <!-- Progress bar variantes -->
-                    <div style="margin:25px 0;">
+                    <div id="parent-progress-section" style="margin:25px 0;">
+                        <div style="text-align:center;margin-bottom:10px;">
+                            <strong style="color:#f0b849;">📦 Création du produit parent</strong>
+                            <br><small style="color:#666;">Catégories, images, meta-données...</small>
+                        </div>
+                        <div style="background:#f0f0f0;border-radius:10px;overflow:hidden;height:30px;position:relative;box-shadow:inset 0 2px 4px rgba(0,0,0,0.1);">
+                            <div id="parent-progress-bar" style="height:100%;width:0%;transition:width 0.5s ease;background:linear-gradient(90deg, #f0b849 0%, #f39c12 100%);"></div>
+                            <div style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);font-weight:700;font-size:14px;color:#fff;text-shadow:0 1px 2px rgba(0,0,0,0.5);">
+                                <span id="parent-progress-percent">0%</span>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div id="variants-progress-section" style="margin:25px 0;display:none;">
+                        <div style="text-align:center;margin-bottom:10px;">
+                            <strong style="color:#2271b1;">🔧 Création des variantes</strong>
+                        </div>
                         <div style="background:#f0f0f0;border-radius:10px;overflow:hidden;height:40px;position:relative;box-shadow:inset 0 2px 4px rgba(0,0,0,0.1);">
                             <div id="variants-progress-bar" style="height:100%;width:0%;transition:width 0.3s ease, background-color 0.3s ease;background-color:#dc3232;"></div>
                             <div style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);font-weight:700;font-size:16px;color:#fff;text-shadow:0 1px 2px rgba(0,0,0,0.5);">
@@ -1089,8 +1036,7 @@ function api_import_to_wc_page() {
                         </div>
                     </div>
                     
-                    <!-- Produit en cours -->
-                    <div id="current-product-box" style="margin:20px 0;padding:20px;background:#f0f6ff;border-radius:8px;border-left:4px solid #2271b1;min-height:100px;">
+                    <div id="current-product-box" style="margin:20px 0;padding:20px;background:#f0f6ff;border-radius:8px;border-left:4px solid #2271b1;min-height:150px;">
                         <div id="current-product-info" style="font-size:14px;color:#666;">En attente...</div>
                     </div>
                 </div>
@@ -1199,6 +1145,13 @@ function api_import_to_wc_page() {
                                            data-deleted="<?php echo $is_deleted ? '1' : '0'; ?>"
                                            data-no-price="<?php echo $has_no_price ? '1' : '0'; ?>"
                                            data-variants-count="<?php echo $variants_count; ?>"
+                                           data-sku="<?php echo esc_attr($product['sku']); ?>"
+                                           data-name="<?php echo esc_attr($product['name']); ?>"
+                                           data-brand="<?php echo esc_attr($product['brand']); ?>"
+                                           data-category="<?php echo esc_attr($product['category']); ?>"
+                                           data-base-price="<?php echo $base_price; ?>"
+                                           data-final-price="<?php echo $wc_price; ?>"
+                                           data-margin="<?php echo $margin_percent; ?>"
                                            <?php echo $checkbox_disabled ? 'disabled title="' . esc_attr($disable_reason) . '"' : ''; ?>>
                                 </td>
                                 <td>
@@ -1440,6 +1393,36 @@ function api_import_to_wc_page() {
         100% { transform: rotate(360deg); }
     }
 
+    .product-info-card {
+        background: #fff;
+        border: 1px solid #e0e0e0;
+        border-radius: 8px;
+        padding: 15px;
+        margin-bottom: 15px;
+    }
+    
+    .product-info-row {
+        display: flex;
+        justify-content: space-between;
+        padding: 8px 0;
+        border-bottom: 1px solid #f0f0f0;
+    }
+    
+    .product-info-row:last-child {
+        border-bottom: none;
+    }
+    
+    .product-info-label {
+        font-weight: 600;
+        color: #666;
+        font-size: 13px;
+    }
+    
+    .product-info-value {
+        font-size: 13px;
+        color: #333;
+    }
+
     .tablenav { margin: 15px 0; }
     .tablenav-pages { float: right; }
     .pagination-links { white-space: nowrap; display: inline-block; margin-left: 10px; }
@@ -1489,10 +1472,11 @@ function api_import_to_wc_page() {
     jQuery(document).ready(function($){
         
         var progressPollInterval = null;
+        var parentCreationStarted = false;
+        var parentProgressPercent = 0;
         
-        // ✅ Fonction de polling pour récupérer le progrès
         function startProgressPolling() {
-            console.log('API v11.0 - Starting progress polling');
+            
             progressPollInterval = setInterval(function() {
                 $.ajax({
                     url: ajaxurl,
@@ -1504,27 +1488,46 @@ function api_import_to_wc_page() {
                     success: function(response) {
                         if (response.success) {
                             var data = response.data;
-                            console.log('API v11.0 - Progress update:', data);
+                            
+                            if (data.variants_current === 0 && data.variants_total > 0) {
+                                if (!parentCreationStarted) {
+                                    parentCreationStarted = true;
+                                    parentProgressPercent = 30;
+                                } else if (parentProgressPercent < 90) {
+                                    parentProgressPercent += 10;
+                                }
+                                
+                                $('#parent-progress-bar').css('width', parentProgressPercent + '%');
+                                $('#parent-progress-percent').text(parentProgressPercent + '%');
+                            }
+                            
+                            if (data.variants_current > 0) {
+                                $('#parent-progress-bar').css('width', '100%');
+                                $('#parent-progress-percent').html('<strong style="color:#46b450;">100%</strong>');
+                                
+                                setTimeout(function() {
+                                    $('#parent-progress-section').fadeOut(300, function() {
+                                        $('#variants-progress-section').fadeIn(300);
+                                    });
+                                }, 500);
+                            }
+                            
                             updateProgressBar(
                                 data.variants_current,
                                 data.variants_total,
                                 data.products_current,
                                 data.products_total
                             );
-                        } else {
-                            console.error('API v11.0 - Progress polling failed:', response);
                         }
                     },
                     error: function(xhr, status, error) {
-                        console.error('API v11.0 - Polling AJAX error:', error);
                     }
                 });
-            }, 300); // Polling toutes les 300ms
+            }, 1000);
         }
         
         function stopProgressPolling() {
             if (progressPollInterval) {
-                console.log('API v11.0 - Stopping progress polling');
                 clearInterval(progressPollInterval);
                 progressPollInterval = null;
             }
@@ -1532,14 +1535,6 @@ function api_import_to_wc_page() {
         
         function updateProgressBar(variantsProcessed, totalVariants, productsImported, totalProducts) {
             var percent = totalVariants > 0 ? Math.round((variantsProcessed / totalVariants) * 100) : 0;
-            
-            console.log('API v11.0 - Updating progress bar:', {
-                variantsProcessed: variantsProcessed,
-                totalVariants: totalVariants,
-                productsImported: productsImported,
-                totalProducts: totalProducts,
-                percent: percent
-            });
             
             $('#variants-progress-bar').css({
                 'width': percent + '%',
@@ -1732,31 +1727,86 @@ function api_import_to_wc_page() {
             }
         });
         
-        // ✅ Import avec polling
+        function displayProductInfo(productData) {
+            var html = '<div class="product-info-card">';
+            html += '<div style="font-weight:700;font-size:16px;color:#2271b1;margin-bottom:12px;">📦 ' + productData.sku + '</div>';
+            
+            html += '<div class="product-info-row">';
+            html += '<span class="product-info-label">Nom:</span>';
+            html += '<span class="product-info-value">' + productData.name + '</span>';
+            html += '</div>';
+            
+            if (productData.brand) {
+                html += '<div class="product-info-row">';
+                html += '<span class="product-info-label">Marque:</span>';
+                html += '<span class="product-info-value">' + productData.brand + '</span>';
+                html += '</div>';
+            }
+            
+            html += '<div class="product-info-row">';
+            html += '<span class="product-info-label">Catégorie:</span>';
+            html += '<span class="product-info-value"><strong>' + productData.category + '</strong></span>';
+            html += '</div>';
+            
+            html += '<div class="product-info-row">';
+            html += '<span class="product-info-label">Prix initial:</span>';
+            html += '<span class="product-info-value" style="color:#dc3232;font-weight:600;">' + parseFloat(productData.base_price).toFixed(2) + '€</span>';
+            html += '</div>';
+            
+            if (productData.margin > 0) {
+                html += '<div class="product-info-row">';
+                html += '<span class="product-info-label">Marge appliquée:</span>';
+                html += '<span class="product-info-value" style="color:#46b450;font-weight:600;">+' + productData.margin + '%</span>';
+                html += '</div>';
+            }
+            
+            html += '<div class="product-info-row">';
+            html += '<span class="product-info-label">Prix final:</span>';
+            html += '<span class="product-info-value" style="color:#2271b1;font-weight:700;font-size:15px;">' + parseFloat(productData.final_price).toFixed(2) + '€</span>';
+            html += '</div>';
+            
+            html += '<div class="product-info-row">';
+            html += '<span class="product-info-label">Variantes:</span>';
+            html += '<span class="product-info-value"><span style="background:#0073aa;color:white;padding:2px 8px;border-radius:3px;font-size:11px;">' + productData.variants_count + '</span></span>';
+            html += '</div>';
+            
+            html += '</div>';
+            
+            return html;
+        }
+        
         $('#start-import').on('click', function() {
-            console.log('=== API v11.0 - START IMPORT ===');
             
             var selectedIds = [];
+            var selectedProductsData = [];
             var totalVariantsExpected = 0;
             
             $('.product-checkbox:checked:not(:disabled)').each(function() {
                 var productId = parseInt($(this).val());
                 var variantsCount = parseInt($(this).data('variants-count')) || 1;
                 
+                var productData = {
+                    id: productId,
+                    sku: $(this).data('sku'),
+                    name: $(this).data('name'),
+                    brand: $(this).data('brand'),
+                    category: $(this).data('category'),
+                    base_price: parseFloat($(this).data('base-price')),
+                    final_price: parseFloat($(this).data('final-price')),
+                    margin: parseFloat($(this).data('margin')),
+                    variants_count: variantsCount
+                };
+                
                 selectedIds.push(productId);
+                selectedProductsData.push(productData);
                 totalVariantsExpected += variantsCount;
             });
-
-            console.log('API v11.0 - Selected products:', selectedIds.length);
-            console.log('API v11.0 - Total variants expected:', totalVariantsExpected);
 
             if (selectedIds.length === 0) {
                 alert('Veuillez sélectionner au moins un produit');
                 return;
             }
 
-            // ✅ Initialiser les variables globales
-            console.log('API v11.0 - Initializing progress...');
             $.ajax({
                 url: ajaxurl,
                 type: 'POST',
@@ -1765,12 +1815,6 @@ function api_import_to_wc_page() {
                     nonce: '<?php echo wp_create_nonce('api_import_wc_nonce'); ?>',
                     total_variants: totalVariantsExpected,
                     total_products: selectedIds.length
-                },
-                success: function(response) {
-                    console.log('API v11.0 - Progress initialized:', response);
-                },
-                error: function(xhr, status, error) {
-                    console.error('API v11.0 - Init error:', error);
                 }
             });
 
@@ -1778,24 +1822,28 @@ function api_import_to_wc_page() {
             $('#import-progress-view').show();
             $('#import-summary').hide();
             
-            $('#variants-counter').text('0/' + totalVariantsExpected + ' variantes');
-            $('#products-counter').text('0/' + selectedIds.length + ' produits');
+            $('#parent-progress-section').show();
+            $('#variants-progress-section').hide();
+            $('#parent-progress-bar').css('width', '0%');
+            $('#parent-progress-percent').text('0%');
             $('#variants-progress-bar').css('width', '0%');
             $('#variants-progress-percent').text('0%');
+            $('#variants-counter').text('0/' + totalVariantsExpected + ' variantes');
+            $('#products-counter').text('0/' + selectedIds.length + ' produits');
+            $('#current-product-info').html('En attente...');
+            
+            parentCreationStarted = false;
+            parentProgressPercent = 0;
             
             var totalProductsImported = 0;
             var totalVariantsProcessed = 0;
             var totalErrors = 0;
             var errorMessages = [];
             
-            // ✅ Démarrer le polling
             startProgressPolling();
             
-            // ✅ Fonction récursive pour importer séquentiellement
             function importNext(index) {
                 if (index >= selectedIds.length) {
-                    console.log('=== API v11.0 - IMPORT COMPLETE ===');
-                    // Tous les produits sont traités
                     stopProgressPolling();
                     
                     $('#import-progress-view').hide();
@@ -1816,11 +1864,13 @@ function api_import_to_wc_page() {
                 }
                 
                 var productId = selectedIds[index];
+                var productData = selectedProductsData[index];
                 var currentNum = index + 1;
                 
-                console.log('API v11.0 - Importing product', currentNum, '/', selectedIds.length, '- ID:', productId);
+                var productInfoHtml = '<div style="text-align:center;color:#f0b849;font-size:14px;margin-bottom:10px;">⏳ Produit ' + currentNum + '/' + selectedIds.length + ' en cours...</div>';
+                productInfoHtml += displayProductInfo(productData);
                 
-                $('#current-product-info').html('<strong>⏳ Traitement produit ' + currentNum + '/' + selectedIds.length + '...</strong><br>ID: ' + productId);
+                $('#current-product-info').html(productInfoHtml);
                 
                 $.ajax({
                     url: ajaxurl,
@@ -1831,7 +1881,6 @@ function api_import_to_wc_page() {
                         product_id: productId
                     },
                     success: function(response) {
-                        console.log('API v11.0 - Product response:', response);
                         
                         if (response.success) {
                             var data = response.data;
@@ -1840,43 +1889,48 @@ function api_import_to_wc_page() {
                             var variantsCount = data.variants_count || 1;
                             totalVariantsProcessed += variantsCount;
                             
-                            console.log('API v11.0 - Product imported:', data.sku, '- Variants:', variantsCount);
+                            var successHtml = '<div style="text-align:center;color:#46b450;font-size:16px;margin-bottom:15px;font-weight:700;">✅ Produit importé avec succès !</div>';
+                            successHtml += displayProductInfo(productData);
+                            successHtml += '<div style="margin-top:12px;padding-top:12px;border-top:1px solid #ddd;text-align:center;">';
+                            successHtml += '<span style="color:#2271b1;font-weight:600;">WooCommerce ID: ' + data.wc_product_id + '</span>';
+                            successHtml += '</div>';
                             
-                            $('#current-product-info').html(
-                                '<strong>✅ ' + data.sku + '</strong><br>' +
-                                data.name + '<br>' +
-                                '<span style="color:#2271b1;font-size:12px;">' + variantsCount + ' variante(s) créée(s)</span>'
-                            );
+                            $('#current-product-info').html(successHtml);
                         } else {
                             totalErrors++;
                             var sku = response.data && response.data.sku ? response.data.sku : 'Produit ' + productId;
                             var message = response.data && response.data.message ? response.data.message : 'Erreur inconnue';
                             errorMessages.push(sku + ': ' + message);
                             
-                            console.error('API v11.0 - Product error:', message);
+                            var errorHtml = '<div style="text-align:center;color:#dc3232;font-size:16px;margin-bottom:15px;font-weight:700;">❌ Erreur d\'importation</div>';
+                            errorHtml += displayProductInfo(productData);
+                            errorHtml += '<div style="margin-top:12px;padding-top:12px;border-top:1px solid #ddd;text-align:center;color:#dc3232;">';
+                            errorHtml += '<strong>Erreur:</strong> ' + message;
+                            errorHtml += '</div>';
                             
-                            $('#current-product-info').html('<strong style="color:#dc3232;">❌ ' + message + '</strong>');
+                            $('#current-product-info').html(errorHtml);
                         }
                     },
                     error: function(xhr, status, error) {
                         totalErrors++;
                         errorMessages.push('Produit ' + productId + ': Erreur réseau - ' + error);
                         
-                        console.error('API v11.0 - AJAX error:', error);
+                        var errorHtml = '<div style="text-align:center;color:#dc3232;font-size:16px;margin-bottom:15px;font-weight:700;">❌ Erreur réseau</div>';
+                        errorHtml += displayProductInfo(productData);
+                        errorHtml += '<div style="margin-top:12px;padding-top:12px;border-top:1px solid #ddd;text-align:center;color:#dc3232;">';
+                        errorHtml += '<strong>Erreur:</strong> ' + error;
+                        errorHtml += '</div>';
                         
-                        $('#current-product-info').html('<strong style="color:#dc3232;">❌ Erreur réseau</strong>');
+                        $('#current-product-info').html(errorHtml);
                     },
                     complete: function() {
-                        // Passer au produit suivant après 300ms
                         setTimeout(function() {
                             importNext(index + 1);
-                        }, 300);
+                        }, 500);
                     }
                 });
             }
             
-            // Démarrer l'import
-            console.log('API v11.0 - Starting import loop');
             importNext(0);
         });
 
