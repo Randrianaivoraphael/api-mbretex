@@ -431,16 +431,60 @@ function api_create_woocommerce_product_full($product_api_data, $price_stock_dat
             }
         }
 
-        $regular_price = floatval($variant['regular_price'] ?? $variant['price'] ?? 0);
-        if ($regular_price > 0) {
-            if ($margin_percent > 0 && $category_name && function_exists('api_calculate_price_with_margin')) {
-                $regular_price = api_calculate_price_with_margin($regular_price, $category_name);
+        $price_already_set = false;
+        $regular_price = null;
+        $sale_price = null;
+        
+        // Priorité 1 : Prix pré-calculé avec marge + arrondi
+        if (isset($variant['regular_price']) && $variant['regular_price'] > 0) {
+            $regular_price = floatval($variant['regular_price']);
+            $price_already_set = true;
+            error_log("API Imbretex v8.6 - Variation {$variant_sku}: Prix pré-calculé {$regular_price}€");
+        }
+        
+        if (isset($variant['price']) && $variant['price'] > 0) {
+            if (!$regular_price) {
+                $regular_price = floatval($variant['price']);
+                $price_already_set = true;
+                error_log("API Imbretex v8.6 - Variation {$variant_sku}: Prix pré-calculé (price) {$regular_price}€");
             }
-            if (function_exists('api_round_price_to_5cents')) {
-                $regular_price = api_round_price_to_5cents($regular_price);
+        }
+        
+        // Priorité 2 : Fallback API avec ARRONDI PSYCHOLOGIQUE
+        if (!$price_already_set) {
+            $variant_price_stock = api_get_product_price_stock($variant_sku);
+            
+            if ($variant_price_stock) {
+                if (isset($variant_price_stock['price']) && $variant_price_stock['price'] > 0) {
+                    $regular_price = floatval($variant_price_stock['price']);
+                    $regular_price = api_round_price_to_5cents($regular_price);
+                    error_log("API Imbretex v8.6 - Variation {$variant_sku}: Prix API arrondi {$regular_price}€");
+                }
+                
+                if (isset($variant_price_stock['price_box']) && $variant_price_stock['price_box'] > 0) {
+                    $price_box = floatval($variant_price_stock['price_box']);
+                    $price_box = api_round_price_to_5cents($price_box);
+                    
+                    if ($regular_price && $price_box < $regular_price) {
+                        $sale_price = $price_box;
+                    } elseif (!$regular_price) {
+                        $regular_price = $price_box;
+                    }
+                }
             }
+        }
+        
+        // APPLIQUER LES PRIX
+        if ($regular_price) {
             $variation->set_regular_price($regular_price);
-            $variation->set_price($regular_price);
+            
+            if ($sale_price) {
+                $variation->set_sale_price($sale_price);
+            } else {
+                $variation->set_price($regular_price);
+            }
+            
+            error_log("API Imbretex v8.6 - Variation {$variant_sku}: Prix appliqué regular={$regular_price}€");
         }
 
         $total_stock = intval($variant['stock_quantity'] ?? 0);
