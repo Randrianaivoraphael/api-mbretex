@@ -536,8 +536,8 @@ function api_db_get_products_filtered($filters = [], $limit = 10, $offset = 0) {
     }
     
     if (!empty($filters['category'])) {
-        $where[] = 'category LIKE %s';
-        $params[] = '%' . $wpdb->esc_like($filters['category']) . '%';
+        $where[] = 'category = %s';
+        $params[] = $filters['category'];
     }
     
     if (!empty($filters['status'])) {
@@ -590,13 +590,13 @@ function api_db_count_products_filtered($filters = []) {
     }
     
     if (!empty($filters['brand'])) {
-        $where[] = 'brand = %s';
+        $where[] = 'brand = %s'; 
         $params[] = $filters['brand'];
     }
     
     if (!empty($filters['category'])) {
-        $where[] = 'category LIKE %s';
-        $params[] = '%' . $wpdb->esc_like($filters['category']) . '%';
+        $where[] = 'category = %s';
+        $params[] = $filters['category'];
     }
     
     if (!empty($filters['status'])) {
