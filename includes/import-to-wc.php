@@ -435,22 +435,18 @@ function api_create_woocommerce_product_full($product_api_data, $price_stock_dat
         $regular_price = null;
         $sale_price = null;
         
-        // Priorité 1 : Prix pré-calculé avec marge + arrondi
         if (isset($variant['regular_price']) && $variant['regular_price'] > 0) {
             $regular_price = floatval($variant['regular_price']);
             $price_already_set = true;
-            error_log("API Imbretex v8.6 - Variation {$variant_sku}: Prix pré-calculé {$regular_price}€");
         }
         
         if (isset($variant['price']) && $variant['price'] > 0) {
             if (!$regular_price) {
                 $regular_price = floatval($variant['price']);
                 $price_already_set = true;
-                error_log("API Imbretex v8.6 - Variation {$variant_sku}: Prix pré-calculé (price) {$regular_price}€");
             }
         }
         
-        // Priorité 2 : Fallback API avec ARRONDI PSYCHOLOGIQUE
         if (!$price_already_set) {
             $variant_price_stock = api_get_product_price_stock($variant_sku);
             
@@ -458,7 +454,6 @@ function api_create_woocommerce_product_full($product_api_data, $price_stock_dat
                 if (isset($variant_price_stock['price']) && $variant_price_stock['price'] > 0) {
                     $regular_price = floatval($variant_price_stock['price']);
                     $regular_price = api_round_price_to_5cents($regular_price);
-                    error_log("API Imbretex v8.6 - Variation {$variant_sku}: Prix API arrondi {$regular_price}€");
                 }
                 
                 if (isset($variant_price_stock['price_box']) && $variant_price_stock['price_box'] > 0) {
@@ -474,7 +469,6 @@ function api_create_woocommerce_product_full($product_api_data, $price_stock_dat
             }
         }
         
-        // APPLIQUER LES PRIX
         if ($regular_price) {
             $variation->set_regular_price($regular_price);
             
@@ -483,8 +477,6 @@ function api_create_woocommerce_product_full($product_api_data, $price_stock_dat
             } else {
                 $variation->set_price($regular_price);
             }
-            
-            error_log("API Imbretex v8.6 - Variation {$variant_sku}: Prix appliqué regular={$regular_price}€");
         }
 
         $total_stock = intval($variant['stock_quantity'] ?? 0);
@@ -849,9 +841,13 @@ add_action('wp_ajax_api_import_single_product', function() {
             
             $wpdb->update(
                 $table_name,
-                ['imported' => 1, 'wc_product_id' => $result],
+                [
+                    'imported' => 1,
+                    'wc_product_id' => $result,
+                    'wc_status' => 'draft'
+                ],
                 ['id' => $product_id],
-                ['%d', '%d'],
+                ['%d', '%d', '%s'],
                 ['%d']
             );
             
@@ -916,7 +912,7 @@ function api_import_to_wc_page() {
     
     ?>
     <div class="wrap">
-        <h1>➡️ Importation vers WooCommerce <span style="font-size:14px;color:#666;">v11.3 ⚡</span></h1>
+        <h1>➡️ Importation vers WooCommerce <span style="font-size:14px;color:#666;">v11.8 - Vérification Auto Statut WC ✅</span></h1>
         
         <?php if (!function_exists('api_get_category_margin')): ?>
         <div class="notice notice-warning" style="margin:15px 0;padding:12px;">
@@ -1131,13 +1127,13 @@ function api_import_to_wc_page() {
                             <th style="width:80px;">Marge</th>
                             <th style="width:110px;">Prix Final</th>
                             <th style="width:90px;">Variants</th>
-                            <th style="width:100px;">Statut</th>
                             <th style="width:100px;">Importé WC</th>
+                            <th style="width:110px;">Statut WC</th>
                         </tr>
                     </thead>
                     <tbody>
                         <?php if (empty($products)): ?>
-                            <tr><td colspan="11" style="text-align:center;padding:30px;">
+                            <tr><td colspan="12" style="text-align:center;padding:30px;">
                                 Aucun produit trouvé.
                             </td></tr>
                         <?php else: ?>
@@ -1146,6 +1142,8 @@ function api_import_to_wc_page() {
                                 $is_deleted = $product['is_deleted'] == 1;
                                 $base_price = floatval($product['price']);
                                 $has_no_price = ($base_price <= 0);
+                                
+                                $wc_status = $product['wc_status'] ?? null;
                                 
                                 $category = $product['category'];
                                 $margin_percent = 0;
@@ -1158,6 +1156,36 @@ function api_import_to_wc_page() {
                                         if (function_exists('api_round_price_to_5cents')) {
                                             $wc_price = api_round_price_to_5cents($wc_price);
                                         }
+                                    }
+                                }
+                                
+                                if ($is_imported && ($wc_status === null || $wc_status === '') && $product['wc_product_id']) {
+                                    $wc_product_obj = wc_get_product($product['wc_product_id']);
+                                    
+                                    if ($wc_product_obj && !is_wp_error($wc_product_obj)) {
+                                        $wc_status = $wc_product_obj->get_status();
+                                        
+                                        global $wpdb;
+                                        $table_name = $wpdb->prefix . 'imbretex_products';
+                                        $wpdb->update(
+                                            $table_name,
+                                            ['wc_status' => $wc_status],
+                                            ['id' => $product['id']],
+                                            ['%s'],
+                                            ['%d']
+                                        );
+                                    } else {
+                                        $wc_status = 'deleted';
+                                        
+                                        global $wpdb;
+                                        $table_name = $wpdb->prefix . 'imbretex_products';
+                                        $wpdb->update(
+                                            $table_name,
+                                            ['wc_status' => 'deleted'],
+                                            ['id' => $product['id']],
+                                            ['%s'],
+                                            ['%d']
+                                        );
                                     }
                                 }
                                 
@@ -1258,15 +1286,32 @@ function api_import_to_wc_page() {
                                         <span style="color:#f0b849;">🔄 MAJ</span>
                                     <?php endif; ?>
                                 </td>
-                                <td>
-                                    <?php if ($is_imported): ?>
-                                        <span style="color:#46b450;">✓ Oui</span>
-                                        <?php if ($product['wc_product_id']): ?>
-                                            <a href="<?php echo admin_url('post.php?post=' . $product['wc_product_id'] . '&action=edit'); ?>" 
-                                               target="_blank" title="Voir dans WC" style="margin-left:5px;">🔗</a>
-                                        <?php endif; ?>
+                                
+                                <td style="text-align:center;">
+                                    <?php if (!$is_imported || !$wc_status): ?>
+                                        <span style="background:#e0e0e0;color:#666;padding:4px 10px;border-radius:12px;font-size:11px;font-weight:600;display:inline-block;">
+                                            ⚪ À importer 
+                                        </span>
+                                    <?php elseif ($wc_status === 'publish'): ?>
+                                        <span style="background:#46b450;color:white;padding:4px 10px;border-radius:12px;font-size:11px;font-weight:600;display:inline-block;">
+                                            ✅ Publié
+                                        </span>
+                                    <?php elseif ($wc_status === 'draft'): ?>
+                                        <span style="background:#f0b849;color:white;padding:4px 10px;border-radius:12px;font-size:11px;font-weight:600;display:inline-block;">
+                                            📝 Brouillon
+                                        </span>
+                                    <?php elseif ($wc_status === 'trash'): ?>
+                                        <span style="background:#ff9800;color:white;padding:4px 10px;border-radius:12px;font-size:11px;font-weight:600;display:inline-block;">
+                                            🗑️ Corbeille
+                                        </span>
+                                    <?php elseif ($wc_status === 'deleted'): ?>
+                                        <span style="background:#dc3232;color:white;padding:4px 10px;border-radius:12px;font-size:11px;font-weight:600;display:inline-block;">
+                                            ❌ Supprimé
+                                        </span>
                                     <?php else: ?>
-                                        <span style="color:#999;">➕ Non</span>
+                                        <span style="background:#826eb4;color:white;padding:4px 10px;border-radius:12px;font-size:11px;font-weight:600;display:inline-block;">
+                                            ⚡ <?php echo esc_html(ucfirst($wc_status)); ?>
+                                        </span>
                                     <?php endif; ?>
                                 </td>
                             </tr>
